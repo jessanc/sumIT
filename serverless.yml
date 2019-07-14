@@ -45,6 +45,14 @@ functions:
           path: summarize
           method: post
           cors: true
+  getSummary:
+    handler: handler.getSummary
+    events:
+      - http:
+          path: getSummary
+          method: get
+          cors: true
+
 resources:
   Resources:
     UploadBucket:
