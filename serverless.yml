@@ -38,6 +38,13 @@ functions:
           path: uploadAudio
           method: post
           cors: true
+  summarize:
+    handler: handler.summarize
+    events:
+      - http:
+          path: summarize
+          method: post
+          cors: true
 resources:
   Resources:
     UploadBucket:
