@@ -4,6 +4,9 @@ const AWS = require('aws-sdk');
 const uuid = require('uuid/v4');
 const fileType = require('file-type');
 const rp = require('request-promise');
+var AYLIENTextAPI = require('aylien_textapi');
+var promise = require('promise');
+
 AWS.config.setPromisesDependency(require('bluebird'));
 
 const s3BasePath = 'https://sumitaudios.s3-us-west-2.amazonaws.com/';
@@ -30,15 +33,15 @@ module.exports.uploadAudio = async (event, context) => {
 
   //check if meetingId exists in dynamoDB
   var getItemParams = {
-    TableName : process.env.ddbTable,
+    TableName: process.env.ddbTable,
     Key: {
       MeetingId: meetingId
     }
   };
 
   let getItem = await dynamoDb.get(getItemParams).promise();
-  
-  if(getItem != null && Object.entries(getItem).length != 0){
+
+  if (getItem != null && Object.entries(getItem).length != 0) {
     return {
       statusCode: 504,
       headers: {
@@ -81,17 +84,17 @@ module.exports.uploadAudio = async (event, context) => {
     MeetingOwnerEmail: meetingOwnerEmail,
     s3AudioFile: fileFullPath
   }
-  await postToDDB(audioRecord,dynamoDb);
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
-      },
-      body: JSON.stringify({ uploadURL: fileFullPath }),
-    }
+  await postToDDB(audioRecord, dynamoDb);
+  return {
+    statusCode: 200,
+    headers: {
+      'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
+    },
+    body: JSON.stringify({ uploadURL: fileFullPath }),
+  }
 };
 
-let postToDDB = (audioRecord,dynamoDb) => {
+let postToDDB = (audioRecord, dynamoDb) => {
   console.log('Submitting audioRecord' + JSON.stringify(audioRecord));
   console.log("table: " + process.env.ddbTable);
   const audioInfo = {
@@ -102,7 +105,7 @@ let postToDDB = (audioRecord,dynamoDb) => {
     .then(res => audioInfo);
 }
 
-module.exports.summarize = (event, context, callback) => {
+module.exports.summarize = async (event, context) => {
   const dynamoDb = new AWS.DynamoDB.DocumentClient();
   console.log("BODY sent : " + event.body);
   var json = JSON.parse(event.body);
@@ -125,93 +128,84 @@ module.exports.summarize = (event, context, callback) => {
   };
 
   //read json transcribed object from s3
-  rp(getJsonOptions)
-    .then((s3transcribedJson) => {
-      var transcript = s3transcribedJson.results.transcripts[0].transcript;
-      console.log('json object: ' + transcript);
-      return transcript;
-    })
-    .catch(function (err) {
-      // API call failed...
-      console.log("getting json transcribed failed, " + err);
-    }).then((ts) => {
-      var summarizeOptions = {
-        uri: 'https://resoomer.pro/summarizer/',
-        method: 'POST',
-        headers: {
-          'User-Agent': 'Super Agent/0.0.1',
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        form: { 'API_KEY': '80F0D9B0265ABD0F98E33EB9316A578C', 'text': ts },
-        json: true
+  var s3transcribedJson = await rp(getJsonOptions).promise().catch((e) => {
+    console.log("getting json transcribed failed, " + e);
+  })
+
+  var transcript = s3transcribedJson.results.transcripts[0].transcript;
+  console.log('json object: ' + transcript);
+  var textapi = new AYLIENTextAPI({
+    application_id: "83abc0c8",
+    application_key: "f18911ae80fda104092fd2ab2ba8d81a"
+  });
+
+  var myPromise = new Promise(function (resolve, reject) {
+    textapi.summarize({
+      text: transcript,
+      title: meetingId,
+      sentences_percentage: 70,
+    }, function (error, response) {
+      if (error === null) {
+        console.log("inside promise" + JSON.stringify(response));
+        resolve(response.sentences);
       }
+      else {
+        console.log("inside promise: " + error);
+        reject(error);
+      }
+    });
+  })
 
-      // Start the request to get summary
-      rp(summarizeOptions)
-        .then((parsedBody) => {
-          // POST succeeded...
-          console.log("resoomer call successful, response: " + parsedBody);
-          var summary = parsedBody.text.content.replace(/<[^>]*>/g, '');
-          console.log("Summary: " + summary);
+  let summary = await myPromise;
 
-          const params = {
-            TableName: process.env.ddbTable,
-            Key: {
-              MeetingId: meetingId,
-            },
-            ExpressionAttributeNames: {
-              '#MS': 'MeetingSummary',
-            },
-            ExpressionAttributeValues: {
-              ':summary': summary
-            },
-            UpdateExpression: 'SET #MS = :summary',
-            ReturnValues: 'ALL_NEW',
-          };
+  const params = {
+    TableName: process.env.ddbTable,
+    Key: {
+      MeetingId: meetingId,
+    },
+    ExpressionAttributeNames: {
+      '#MS': 'MeetingSummary',
+    },
+    ExpressionAttributeValues: {
+      ':summary': summary
+    },
+    UpdateExpression: 'SET #MS = :summary',
+    ReturnValues: 'ALL_NEW',
+  };
 
-          //put parsedBody in dynamoDb
-          dynamoDb.update(params).promise().then((res) => {
-            console.log("Updated dynamo db with : " + res);
-          }).catch((e) => {
-            console.log("Exception updating ddb" + e);
-            return context.fail('Failed to update dynamoDB with the summary, Error : ' + e);
-          }).then(() => {
-            callback(null, {
-              statusCode: 200,
-              headers: {
-                'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
-              },
-              body: JSON.stringify({ result: "Updated dynamoDB with summary", summary: summary }),
-            })
-          })
-        })
-        .catch((err) => {
-          // POST failed...
-          console.log('resoomer call failed' + err);
-          return context.fail('resoomer call failed' + err);
-        });
-    })
+  //put parsedBody in dynamoDb
+  let res = await dynamoDb.update(params).promise();
+
+  console.log("Updated dynamo db with : " + res);
+
+  return {
+    statusCode: 200,
+    headers: {
+      'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
+    },
+    body: JSON.stringify({ result: "Updated dynamoDB with summary", summary: summary }),
+  }
 }
 
 module.exports.getSummary = async (event, context) => {
   const dynamoDb = new AWS.DynamoDB.DocumentClient();
-    var queryParams = event.queryStringParameters;
-    console.log('params : ' + JSON.stringify(queryParams));
-    var meetingId = queryParams.meetingId;
-    if(meetingId === null){
-      return {
-        statusCode: 500,
-        headers: {
-          'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
-        },
-        body: JSON.stringify({ Error: "meetingId is required in the body" }),
-      };
-    }
+  var queryParams = event.queryStringParameters;
+  console.log('params : ' + JSON.stringify(queryParams));
+  var meetingId = queryParams.meetingId;
+  if (meetingId === null) {
+    return {
+      statusCode: 500,
+      headers: {
+        'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
+      },
+      body: JSON.stringify({ Error: "meetingId is required in the body" }),
+    };
+  }
 
-    console.log("MEETING ID is " + meetingId);
-    //check if meetingId exists in dynamoDB
+  console.log("MEETING ID is " + meetingId);
+  //check if meetingId exists in dynamoDB
   var getItemParams = {
-    TableName : process.env.ddbTable,
+    TableName: process.env.ddbTable,
     Key: {
       MeetingId: meetingId
     }
@@ -221,7 +215,7 @@ module.exports.getSummary = async (event, context) => {
 
   console.log("GETITEM: " + JSON.stringify(getItem));
 
-  if(getItem === null || Object.entries(getItem).length === 0){
+  if (getItem === null || Object.entries(getItem).length === 0) {
     return {
       statusCode: 504,
       headers: {
@@ -235,20 +229,22 @@ module.exports.getSummary = async (event, context) => {
 
   var summary = entry.MeetingSummary;
 
+  console.log("summary: " + summary);
+
   //has not finished processing
-  if(summary === null){
+  if (!summary) {
     return {
       statusCode: 305,
       headers: {
         'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
       },
-      body: JSON.stringify({ Result:  "Audio File has not yet finished processing, try again in some time." }),
+      body: JSON.stringify({ Result: "Audio File has not yet finished processing, try again in some time." }),
     };
   }
 
   //need to put together symmaryJson + transcribedJson
 
-  var s3TranscribedTextLink = entry.s3TranscribedTextLink;
+  var s3transcribedUrl = entry.s3TranscribedTextLink;
 
   //assume this exists since summary is created from 
   var getJsonOptions = {
@@ -258,13 +254,13 @@ module.exports.getSummary = async (event, context) => {
     },
     json: true // Automatically parses the JSON string in the response
   };
-  let s3transcribedJson = rp(getJsonOptions).promise();
+  let s3transcribedJson = await rp(getJsonOptions).promise();
   var transcript = s3transcribedJson.results.transcripts[0].transcript;
 
   var ObjectToReturn = {
-    summary : summary,
-    transcript : transcript, 
-    timestamps : s3transcribedJson.results.items
+    summary: summary,
+    transcript: transcript,
+    timestamps: s3transcribedJson.results.items
   }
 
   return {
@@ -272,8 +268,8 @@ module.exports.getSummary = async (event, context) => {
     headers: {
       'Access-Control-Allow-Origin': '*' //probably only allow the AWS ec2 instance to access
     },
-    body: JSON.stringify({ Result:  JSON.stringify(ObjectToReturn) }),
+    body: JSON.stringify({ Result: JSON.stringify(ObjectToReturn) }),
   };
 
-    
+
 }
